@@ -1,12 +1,12 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ares/application/ceo/planning/dynamic_team_builder.dart';
-import 'package:ares/domain/agents/agent_capability.dart';
-import 'package:ares/domain/agents/agent_library_entry.dart';
-import 'package:ares/domain/agents/agent_definition.dart';
-import 'package:ares/domain/agents/agent_skill.dart';
-import 'package:ares/domain/ceo/planning/ceo_execution_plan.dart';
-import 'package:ares/domain/ceo/planning/plan_step.dart';
-import 'package:ares/domain/tasks/task_priority.dart';
+import 'package:dest_os_ares/application/ceo/planning/dynamic_team_builder.dart';
+import 'package:dest_os_ares/domain/agents/agent_capability.dart';
+import 'package:dest_os_ares/domain/agents/agent_library_entry.dart';
+import 'package:dest_os_ares/domain/agents/agent_definition.dart';
+import 'package:dest_os_ares/domain/agents/agent_skill.dart';
+import 'package:dest_os_ares/domain/ceo/planning/ceo_execution_plan.dart';
+import 'package:dest_os_ares/domain/ceo/planning/plan_step.dart';
+import 'package:dest_os_ares/domain/tasks/task_priority.dart';
 
 void main() {
   test('en uygun ajanı adım için seçer', () {
