@@ -9,7 +9,7 @@ class ChatMessage {
     required this.role,
     required this.text,
     DateTime? createdAt,
-  })  : id = id ?? AresId.generate(),
+  })  : id = id ?? AresId.generate().value,
         createdAt = createdAt ?? DateTime.now();
 
   final String id;
