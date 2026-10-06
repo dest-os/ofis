@@ -1,4 +1,4 @@
-import 'package:test/test.dart';
+import 'package:flutter_test/flutter_test.dart';
 import 'package:dest_os_ares/application/events/event_bus.dart';
 import 'package:dest_os_ares/application/events/event_publisher.dart';
 import 'package:dest_os_ares/application/events/in_memory_event_bus.dart';
