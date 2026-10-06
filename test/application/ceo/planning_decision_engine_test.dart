@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ares/application/ceo/planning/planning_decision_engine.dart';
-import 'package:ares/domain/ceo/planning/planning_decision.dart';
+import 'package:dest_os_ares/application/ceo/planning/planning_decision_engine.dart';
+import 'package:dest_os_ares/domain/ceo/planning/planning_decision.dart';
 
 void main() {
   test('arşiv sonucu diğer kaynaklardan önce seçilir', () {
