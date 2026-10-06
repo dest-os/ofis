@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dest_os_ares/application/ceo/ceo_self_heal_service.dart';
 import 'package:dest_os_ares/application/codegen/code_validator_service.dart';
+import 'package:dest_os_ares/application/codegen/prompt_builder_service.dart';
 import 'package:dest_os_ares/core/result/ares_result.dart';
 import 'package:dest_os_ares/core/security/cost_policy.dart';
 import 'package:dest_os_ares/domain/codegen/code_artifact.dart';
