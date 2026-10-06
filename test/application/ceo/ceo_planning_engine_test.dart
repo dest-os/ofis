@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ares/domain/ceo/ceo_intent.dart';
-import 'package:ares/domain/tasks/task_priority.dart';
-import 'package:ares/application/ceo/planning/ceo_planning_engine.dart';
+import 'package:dest_os_ares/domain/ceo/ceo_intent.dart';
+import 'package:dest_os_ares/domain/tasks/task_priority.dart';
+import 'package:dest_os_ares/application/ceo/planning/ceo_planning_engine.dart';
 
 void main() {
   test('CEO planı hedef ve öncelik ile oluşturur', () {
