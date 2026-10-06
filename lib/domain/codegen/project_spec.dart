@@ -2,54 +2,33 @@ import 'architecture_type.dart';
 
 /// Kod üretim motorunun üreteceği projenin değişmez tanımıdır.
 class ProjectSpec {
-  /// Creates an immutable project specification.
   ProjectSpec({
     required this.projectName,
     required this.description,
     required this.packageName,
-    required this.features,
+    required List<String> features,
     required this.architecture,
-    required this.requiredPackages,
-    required this.screens,
-    required this.acceptanceCriteria,
+    required List<String> requiredPackages,
+    required List<String> screens,
+    required List<String> acceptanceCriteria,
     required this.includeTests,
     required this.includeReadme,
-  }) : features = List.unmodifiable(features),
-       requiredPackages = List.unmodifiable(requiredPackages),
-       screens = List.unmodifiable(screens),
-       acceptanceCriteria = List.unmodifiable(acceptanceCriteria);
+  })  : features = List.unmodifiable(features),
+        requiredPackages = List.unmodifiable(requiredPackages),
+        screens = List.unmodifiable(screens),
+        acceptanceCriteria = List.unmodifiable(acceptanceCriteria);
 
-  /// Display name of the project.
   final String projectName;
-
-  /// High-level description of the requested project.
   final String description;
-
-  /// Dart/Flutter package name.
   final String packageName;
-
-  /// Requested product capabilities.
   final List<String> features;
-
-  /// Architecture strategy to use.
   final ArchitectureType architecture;
-
-  /// Additional packages required by the generated project.
   final List<String> requiredPackages;
-
-  /// Requested screens or presentation surfaces.
   final List<String> screens;
-
-  /// Conditions used to judge whether generation is complete.
   final List<String> acceptanceCriteria;
-
-  /// Whether tests should be included in the generated project.
   final bool includeTests;
-
-  /// Whether project documentation should be included.
   final bool includeReadme;
 
-  /// Returns a copy with the supplied fields replaced.
   ProjectSpec copyWith({
     String? projectName,
     String? description,
