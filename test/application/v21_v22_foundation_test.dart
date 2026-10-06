@@ -1,4 +1,4 @@
-import 'package:test/test.dart';
+import 'package:flutter_test/flutter_test.dart';
 import 'package:dest_os_ares/application/ai_center/ai_center_service.dart';
 import 'package:dest_os_ares/application/automation/automation_guard.dart';
 import 'package:dest_os_ares/core/security/cost_policy.dart';
