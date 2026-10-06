@@ -10,7 +10,7 @@ import 'package:dest_os_ares/domain/tasks/task_priority.dart';
 
 void main() {
   test('görev için yetenekli ajan seçilir', () {
-    const codingAgent = AgentLibraryEntry(
+    final codingAgent = AgentLibraryEntry(
       definition: AgentDefinition(
         id: 'coding',
         name: 'Kodlama',
@@ -24,7 +24,7 @@ void main() {
       createdAt: DateTime.utc(2026, 1, 1),
     );
 
-    const researchAgent = AgentLibraryEntry(
+    final researchAgent = AgentLibraryEntry(
       definition: AgentDefinition(
         id: 'research',
         name: 'Araştırma',
@@ -38,7 +38,7 @@ void main() {
       createdAt: DateTime.utc(2026, 1, 1),
     );
 
-    const contract = TaskContract(
+    final contract = TaskContract(
       id: 'task',
       title: 'Kod yaz',
       description: 'Kod',
@@ -50,7 +50,7 @@ void main() {
 
     final result = AgentMatcher().findBestMatch(
       contract: contract,
-      candidates: const <AgentLibraryEntry>[
+      candidates: <AgentLibraryEntry>[
         researchAgent,
         codingAgent,
       ],
