@@ -29,9 +29,10 @@ class ApiLlmCodeGenerator implements LlmCodeGenerator {
   /// Creates an API-backed code generator using the existing ARES gateway.
   ApiLlmCodeGenerator({
     required this.gateway,
-    this.paidGate = const PaidAiRuntimeGate(),
-    this.decisionEngine = DecisionEngine(),
-  });
+    PaidAiRuntimeGate? paidGate,
+    DecisionEngine? decisionEngine,
+  })  : paidGate = paidGate ?? const PaidAiRuntimeGate(),
+        decisionEngine = decisionEngine ?? DecisionEngine();
 
   /// Existing ARES AI Gateway used for model requests.
   final AresAiGateway gateway;
