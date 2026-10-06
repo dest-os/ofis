@@ -70,7 +70,7 @@ class ProductionRecoveryScreen extends StatelessWidget {
     return _ProductionResult(
       title: item.title,
       success: item.status == LiveOperationStatus.completed,
-      message: item.message,
+      message: item.message ?? '',
       time: item.updatedAt,
     );
   }
