@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dest_os_ares/application/codegen/prompt_builder_service.dart';
 import 'package:dest_os_ares/domain/codegen/project_spec.dart';
+import 'package:dest_os_ares/domain/codegen/architecture_type.dart';
 
 void main() {
   test('ajan promptu önceki ajanların dosya içeriğini taşır', () {
