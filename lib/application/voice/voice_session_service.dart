@@ -7,7 +7,7 @@ class VoiceSessionService {
 
   final DateTime Function() _now;
 
-  VoiceSession start() => VoiceSession(id: AresId.newId(), state: VoiceState.listening, startedAt: _now());
+  VoiceSession start() => VoiceSession(id: AresId.generate(), state: VoiceState.listening, startedAt: _now());
 
   VoiceSession process(VoiceSession session, String transcript) =>
       session.copyWith(state: VoiceState.processing, transcript: transcript);
