@@ -5,7 +5,7 @@ class ProductionReleaseScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const checks = <String>[
+    final checks = <String>[
       'Temel dosyalar',
       'Güvenlik kontrolleri',
       'Yedek ve geri yükleme',
@@ -33,7 +33,7 @@ class ProductionReleaseScreen extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 12),
+          SizedBox(height: 12),
           ...checks.map((title) => _ReleaseCard(title: title)),
         ],
       ),
