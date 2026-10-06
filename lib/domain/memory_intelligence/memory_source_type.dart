@@ -1,1 +1,7 @@
-enum MemorySourceType { user, task, archive, agent, system, external }
+enum MemorySourceType {
+  user,
+  agent,
+  system,
+  archive,
+  production,
+}
