@@ -1,3 +1,4 @@
+import '../../domain/database/entity_record.dart';
 import '../../domain/memory/memory_record.dart';
 import '../../domain/memory/memory_scope.dart';
 import '../../domain/memory/memory_type.dart';
@@ -15,9 +16,7 @@ class PersistentMemoryRepository implements MemoryRepository {
 
   @override
   Future<void> save(MemoryRecord memory) async {
-    await _repository.save(
-      EntityRecordAdapter.toEntity(memory),
-    );
+    await _repository.save(EntityRecordAdapter.toEntity(memory));
   }
 
   @override
@@ -29,23 +28,21 @@ class PersistentMemoryRepository implements MemoryRepository {
   @override
   Future<List<MemoryRecord>> getAll() async {
     final records = await _repository.getAll(entityType);
-    return records.map(EntityRecordAdapter.fromEntity).toList();
+    return <MemoryRecord>[
+      for (final record in records) EntityRecordAdapter.fromEntity(record),
+    ];
   }
 
   @override
   Future<List<MemoryRecord>> search(String query) async {
     final normalized = query.trim().toLowerCase();
     final all = await getAll();
-
     if (normalized.isEmpty) return all;
-
     return all
         .where(
           (memory) =>
               memory.content.toLowerCase().contains(normalized) ||
-              memory.tags.any(
-                (tag) => tag.toLowerCase().contains(normalized),
-              ),
+              memory.tags.any((tag) => tag.toLowerCase().contains(normalized)),
         )
         .toList(growable: false);
   }
@@ -67,48 +64,50 @@ class EntityRecordAdapter {
   const EntityRecordAdapter._();
 
   static EntityRecord toEntity(MemoryRecord memory) {
+    final now = DateTime.now().toUtc();
     return EntityRecord(
       id: memory.id,
       entityType: PersistentMemoryRepository.entityType,
       createdAt: memory.createdAt,
-      updatedAt: DateTime.now().toUtc(),
+      updatedAt: now,
       data: <String, Object?>{
         'content': memory.content,
         'type': memory.type.name,
         'scope': memory.scope.name,
+        'tags': memory.tags,
+        'archived': memory.archived,
         'projectId': memory.projectId,
         'taskId': memory.taskId,
         'confidence': memory.confidence,
         'source': memory.source,
-        'tags': memory.tags,
-        'archived': memory.archived,
       },
     );
   }
 
-  static MemoryRecord fromEntity(EntityRecord entity) {
-    final data = entity.data;
-
+  static MemoryRecord fromEntity(EntityRecord record) {
+    final data = record.data;
+    final tagsRaw = data['tags'];
+    final tags = tagsRaw is List
+        ? tagsRaw.map((e) => e.toString()).toList(growable: false)
+        : const <String>[];
     return MemoryRecord(
-      id: entity.id,
-      content: data['content'] as String? ?? '',
+      id: record.id,
+      content: '${data['content'] ?? ''}',
       type: MemoryType.values.firstWhere(
-        (value) => value.name == data['type'],
-        orElse: () => MemoryType.fact,
+        (item) => item.name == data['type'],
+        orElse: () => MemoryType.values.first,
       ),
       scope: MemoryScope.values.firstWhere(
-        (value) => value.name == data['scope'],
-        orElse: () => MemoryScope.personal,
+        (item) => item.name == data['scope'],
+        orElse: () => MemoryScope.values.first,
       ),
-      createdAt: entity.createdAt,
-      projectId: data['projectId'] as String?,
-      taskId: data['taskId'] as String?,
+      createdAt: record.createdAt,
+      projectId: data['projectId']?.toString(),
+      taskId: data['taskId']?.toString(),
       confidence: (data['confidence'] as num?)?.toDouble() ?? 1.0,
-      source: data['source'] as String?,
-      tags: List<String>.from(
-        (data['tags'] as List<Object?>?) ?? const <Object?>[],
-      ),
-      archived: data['archived'] as bool? ?? false,
+      source: data['source']?.toString(),
+      tags: tags,
+      archived: data['archived'] == true,
     );
   }
 }
