@@ -1,4 +1,4 @@
-import '../../domain/connectors/connector_decision_type.dart';
+import '../../domain/connectors/connector_decision.dart';
 import '../../domain/connectors/connector_result.dart';
 import '../../domain/connectors/connector_request.dart';
 import 'connector_gateway.dart';
