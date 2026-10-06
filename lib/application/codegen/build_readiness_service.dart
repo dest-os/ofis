@@ -101,7 +101,7 @@ class BuildReadinessService {
 
     final brokenImports = <String>[];
     final dartPaths = paths.where((path) => path.endsWith('.dart')).toSet();
-    final importPattern = RegExp(r"import\s+['\"](lib/[^'\"]+)['\"];");
+    final importPattern = RegExp("import\s+['\"]([^'\"]+)['\"];");
     for (final artifact in artifacts.where((item) => item.type.name == 'dart')) {
       for (final match in importPattern.allMatches(artifact.content)) {
         final imported = match.group(1);
