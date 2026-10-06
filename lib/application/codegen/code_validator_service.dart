@@ -116,7 +116,7 @@ class CodeValidatorService {
         final target = _resolveRelativeImport(path, importPath);
         if (!_containsPath(artifacts, target)) {
           errors.add('$path: Eksik relative import: $importPath -> $target');
-          actions.add('$path: $importPath importunu mevcut bir artifact'e yönelt veya gerekli dosyayı üret.');
+          actions.add("$path: $importPath importunu mevcut bir artifact dosyasına yönelt veya gerekli dosyayı üret.");
         }
       }
     }
