@@ -1,6 +1,7 @@
 import '../../core/security/cost_policy.dart';
 import '../../domain/ai/ai_category.dart';
 import '../../domain/security/risk_assessment.dart';
+import '../../domain/security/risk_level.dart';
 import '../../domain/security/security_decision.dart';
 import '../../domain/security/security_principal.dart';
 import '../../domain/security/permission_level.dart';
