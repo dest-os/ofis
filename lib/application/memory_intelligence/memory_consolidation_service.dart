@@ -1,3 +1,4 @@
+import '../../domain/memory_intelligence/memory_source_type.dart';
 import '../../domain/memory_intelligence/memory_consolidation_result.dart';
 import '../../domain/memory_intelligence/memory_fact.dart';
 import '../../domain/memory_intelligence/memory_reliability.dart';
