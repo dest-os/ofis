@@ -1,3 +1,4 @@
+import '../../domain/codegen/artifact_type.dart';
 import 'dart:io';
 
 import '../../domain/codegen/code_artifact.dart';
