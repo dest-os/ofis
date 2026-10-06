@@ -17,7 +17,7 @@ void main() {
       riskLevel: ToolRiskLevel.high,
     );
 
-    const request = ToolRequest(
+    final request = ToolRequest(
       id: 'request-1',
       toolId: 'high-risk',
       action: 'write',
