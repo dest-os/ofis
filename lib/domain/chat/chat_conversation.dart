@@ -3,7 +3,7 @@ import 'chat_message.dart';
 
 class ChatConversation {
   ChatConversation({String? id, required this.title, List<ChatMessage>? messages, DateTime? updatedAt})
-      : id = id ?? AresId.generate(),
+      : id = id ?? AresId.generate().value,
         messages = messages ?? <ChatMessage>[],
         updatedAt = updatedAt ?? DateTime.now();
 
