@@ -282,29 +282,99 @@ class _StatusBox extends StatelessWidget {
   Widget build(BuildContext context) => Container(padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: ok ? const Color(0xFF0D2B22) : const Color(0xFF2A2012), borderRadius: BorderRadius.circular(10)), child: Row(children: [Icon(ok ? Icons.check_circle : Icons.warning_amber, color: ok ? Colors.greenAccent : Colors.orangeAccent), const SizedBox(width: 10), Expanded(child: Text(text, maxLines: 3, overflow: TextOverflow.ellipsis))]));
 }
 
+
 class _CatalogCard extends StatelessWidget {
-  const _CatalogCard({required this.title, required this.text, required this.icon, this.primary = false});
+  const _CatalogCard({
+    required this.title,
+    required this.text,
+    required this.icon,
+    this.primary = false,
+  });
+
   final String title;
   final String text;
   final IconData icon;
   final bool primary;
+
   @override
-  Widget build(BuildContext context) => Card(color: const Color(0xFF0A1722), child: ListTile(minVerticalPadding: 16, leading: Icon(icon, color: primary ? Colors.cyanAccent : Colors.white70, size: 32), title: Text(title), subtitle: Text(text), trailing: primary ? const Chip(label: Text('BİRİNCİL')) : null));
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFF0A1722),
+      child: ListTile(
+        minVerticalPadding: 16,
+        leading: Icon(
+          icon,
+          color: primary ? Colors.cyanAccent : Colors.white70,
+          size: 32,
+        ),
+        title: Text(title),
+        subtitle: Text(text),
+        trailing: primary ? const Chip(label: Text('BIRINCIL')) : null,
+      ),
+    );
+  }
 }
 
 class _InfoPanel extends StatelessWidget {
   const _InfoPanel({required this.title, required this.text});
+
   final String title;
   final String text;
+
   @override
-  Widget build(BuildContext context) => Card(color: const Color(0xFF0A1722), child: Padding(padding: const EdgeInsets.all(18), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(color: Colors.cyanAccent, fontSize: 17, fontWeight: FontWeight.bold)), const SizedBox(height: 8), Text(text, style: const TextStyle(color: Colors.white70, height: 1.4))]));
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFF0A1722),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.cyanAccent,
+                fontSize: 17,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              text,
+              style: const TextStyle(color: Colors.white70, height: 1.4),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _OrderRow extends StatelessWidget {
-  const _OrderRow({required this.number, required this.title, required this.text});
+  const _OrderRow({
+    required this.number,
+    required this.title,
+    required this.text,
+  });
+
   final String number;
   final String title;
   final String text;
+
   @override
-  Widget build(BuildContext context) => Card(color: const Color(0xFF0A1722), child: ListTile(minVerticalPadding: 14, leading: CircleAvatar(backgroundColor: Colors.cyanAccent, foregroundColor: Colors.black, child: Text(number)), title: Text(title), subtitle: Text(text)));
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFF0A1722),
+      child: ListTile(
+        minVerticalPadding: 14,
+        leading: CircleAvatar(
+          backgroundColor: Colors.cyanAccent,
+          foregroundColor: Colors.black,
+          child: Text(number),
+        ),
+        title: Text(title),
+        subtitle: Text(text),
+      ),
+    );
+  }
 }
