@@ -1,0 +1,18 @@
+enum TaskStatus {
+  received,
+  understanding,
+  planning,
+  teamBuilding,
+  ready,
+  running,
+  validating,
+  completed,
+  waitingApproval,
+  paused,
+  retrying,
+  blocked,
+  failed,
+  cancelled,
+  reassigning,
+  revision,
+}

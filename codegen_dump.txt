@@ -1,0 +1,1858 @@
+### /mnt/data/v10work/lib/application/codegen/code_generation_orchestrator.dart
+import '../../application/codegen/code_validator_service.dart';
+import '../../application/codegen/code_writer_service.dart';
+import '../../application/codegen/project_scaffold_service.dart';
+import '../../application/codegen/prompt_builder_service.dart';
+import '../../application/events/event_bus.dart';
+import '../../core/result/ares_result.dart';
+import '../../domain/codegen/code_artifact.dart';
+import '../../domain/codegen/generation_plan.dart';
+import '../../domain/codegen/generation_result.dart';
+import '../../domain/codegen/project_spec.dart';
+import '../../domain/events/event_envelope.dart';
+import '../../domain/events/event_type.dart';
+import '../../infrastructure/codegen/llm_code_generator.dart';
+
+/// Kod üretim sürecinin tüm adımlarını yöneten ana orkestratördür.
+///
+/// Akış:
+/// ProjectSpec -> Plan -> Scaffold -> Domain -> Application -> Presentation
+/// -> doğrulama/self-healing -> Disk yazımı -> son doğrulama -> GenerationResult.
+class CodeGenerationOrchestrator {
+  CodeGenerationOrchestrator({
+    required ProjectScaffoldService scaffoldService,
+    required PromptBuilderService promptBuilder,
+    required LlmCodeGenerator llmCodeGenerator,
+    required CodeWriterService codeWriter,
+    required CodeValidatorService validator,
+    this.eventBus,
+    this.logger,
+  })  : _scaffoldService = scaffoldService,
+        _promptBuilder = promptBuilder,
+        _llmCodeGenerator = llmCodeGenerator,
+        _codeWriter = codeWriter,
+        _validator = validator;
+
+  final ProjectScaffoldService _scaffoldService;
+  final PromptBuilderService _promptBuilder;
+  final LlmCodeGenerator _llmCodeGenerator;
+  final CodeWriterService _codeWriter;
+  final CodeValidatorService _validator;
+  final EventBus? eventBus;
+  final void Function(String message)? logger;
+
+  static const int maxRetriesPerStep = 3;
+  static const int maxSelfHealingAttempts = 3;
+
+  Future<GenerationResult> generate(ProjectSpec spec) async {
+    final startedAt = DateTime.now();
+    final logs = <String>[];
+    final errors = <String>[];
+    final artifacts = <CodeArtifact>[];
+    var retryCount = 0;
+    var selfHealingCount = 0;
+
+    Future<void> log(String message) async {
+      final entry = '[${DateTime.now().toIso8601String()}] $message';
+      logs.add(entry);
+      logger?.call(entry);
+    }
+
+    await log('Kod üretimi başlatıldı: ${spec.projectName}.');
+    await _publish(
+      type: EventType.systemStarted,
+      message: 'code_generation_started',
+      projectName: spec.projectName,
+    );
+
+    final plan = _createPlan(spec);
+    await log('GenerationPlan oluşturuldu: ${plan.steps.length} adım.');
+
+    final scaffold = _scaffoldService.generate(spec);
+    artifacts.addAll(scaffold);
+    await log('Proje iskeleti üretildi: ${scaffold.length} artifact.');
+
+    final scaffoldValidation = _validator.validate(scaffold);
+    if (!scaffoldValidation.isValid) {
+      errors.addAll(scaffoldValidation.errors);
+      errors.addAll(scaffoldValidation.suggestedActions.map((action) => 'Öneri: $action'));
+      await log('İskelet doğrulaması başarısız.');
+      return _result(
+        success: false,
+        artifacts: artifacts,
+        errors: errors,
+        logs: logs,
+        retryCount: retryCount,
+        selfHealingCount: selfHealingCount,
+        startedAt: startedAt,
+      );
+    }
+
+    const phases = <_GenerationPhase>[
+      _GenerationPhase(
+        name: 'domain',
+        role: CodegenAgentRole.architect,
+        directory: 'lib/domain/',
+      ),
+      _GenerationPhase(
+        name: 'application',
+        role: CodegenAgentRole.flutterDeveloper,
+        directory: 'lib/application/',
+      ),
+      _GenerationPhase(
+        name: 'presentation',
+        role: CodegenAgentRole.flutterDeveloper,
+        directory: 'lib/presentation/',
+      ),
+    ];
+
+    for (final phase in phases) {
+      await log('${phase.name} üretim adımı başladı.');
+      final result = await _runPhaseWithRetry(
+        phase: phase,
+        spec: spec,
+        existingArtifacts: artifacts,
+        onLog: log,
+      );
+
+      retryCount += result.retries;
+
+      if (result.result is AresFailure<List<CodeArtifact>>) {
+        final failure = result.result as AresFailure<List<CodeArtifact>>;
+        errors.add('${phase.name}: ${failure.message}');
+        await log('${phase.name} adımı başarısız: ${failure.message}');
+        return _result(
+          success: false,
+          artifacts: artifacts,
+          errors: errors,
+          logs: logs,
+          retryCount: retryCount,
+          selfHealingCount: selfHealingCount,
+          startedAt: startedAt,
+        );
+      }
+
+      final success = result.result as AresSuccess<List<CodeArtifact>>;
+      final validation = _validator.validate(<CodeArtifact>[...artifacts, ...success.value]);
+      if (!validation.isValid) {
+        await log('${phase.name} üretimi doğrulamada hata verdi; self-healing başlıyor.');
+        final healed = await _selfHeal(
+          phase: phase,
+          spec: spec,
+          allArtifacts: artifacts,
+          phaseArtifacts: success.value,
+          initialReport: validation,
+          onLog: log,
+        );
+        selfHealingCount += healed.attempts;
+
+        if (!healed.success) {
+          errors.addAll(healed.errors.map((error) => '${phase.name}: $error'));
+          await log('${phase.name} self-healing başarısız.');
+          return _result(
+            success: false,
+            artifacts: artifacts,
+            errors: errors,
+            logs: logs,
+            retryCount: retryCount,
+            selfHealingCount: selfHealingCount,
+            startedAt: startedAt,
+          );
+        }
+
+        artifacts.addAll(healed.artifacts);
+        await log(
+          '${phase.name} self-healing tamamlandı: ${healed.artifacts.length} artifact.',
+        );
+      } else {
+        artifacts.addAll(success.value);
+      }
+
+      await log('${phase.name} üretimi tamamlandı.');
+    }
+
+    final preWriteReport = await _selfHealWholeProject(
+      spec: spec,
+      artifacts: artifacts,
+      onLog: log,
+    );
+    selfHealingCount += preWriteReport.attempts;
+
+    if (!preWriteReport.success) {
+      errors.addAll(preWriteReport.errors);
+      return _result(
+        success: false,
+        artifacts: artifacts,
+        errors: errors,
+        logs: logs,
+        retryCount: retryCount,
+        selfHealingCount: selfHealingCount,
+        startedAt: startedAt,
+      );
+    }
+
+    await log('Toplam ${artifacts.length} artifact diske yazılıyor.');
+    final writeResult = await _codeWriter.writeArtifacts(
+      List.unmodifiable(artifacts),
+      overwrite: false,
+    );
+
+    if (writeResult.errors.isNotEmpty) {
+      errors.addAll(writeResult.errors);
+      await log('Dosya yazma sırasında ${writeResult.errors.length} hata oluştu.');
+    } else {
+      await log('${writeResult.writtenPaths.length} dosya başarıyla yazıldı.');
+    }
+
+    final finalValidation = _validator.validate(artifacts);
+    if (!finalValidation.isValid) {
+      errors.addAll(finalValidation.errors);
+      errors.addAll(finalValidation.suggestedActions.map((action) => 'Öneri: $action'));
+      await log('Son artifact doğrulaması başarısız.');
+    } else {
+      await log('Son artifact doğrulaması başarılı.');
+    }
+
+    final success = errors.isEmpty;
+    await log(success ? 'Kod üretimi başarıyla tamamlandı.' : 'Kod üretimi hatayla tamamlandı.');
+
+    await _publish(
+      type: success ? EventType.systemStopped : EventType.securityAlert,
+      message: success ? 'code_generation_completed' : 'code_generation_failed',
+      projectName: spec.projectName,
+    );
+
+    return _result(
+      success: success,
+      artifacts: artifacts,
+      errors: errors,
+      logs: logs,
+      retryCount: retryCount,
+      selfHealingCount: selfHealingCount,
+      startedAt: startedAt,
+    );
+  }
+
+  GenerationPlan _createPlan(ProjectSpec spec) {
+    const steps = <GenerationStep>[
+      GenerationStep(
+        id: 'scaffold',
+        name: 'Scaffold',
+        description: 'Clean Architecture proje iskeletini oluştur.',
+        order: 1,
+        required: true,
+      ),
+      GenerationStep(
+        id: 'domain',
+        name: 'Domain',
+        description: 'Domain katmanı dosyalarını LLM ile üret.',
+        order: 2,
+        required: true,
+      ),
+      GenerationStep(
+        id: 'application',
+        name: 'Application',
+        description: 'Application katmanı dosyalarını LLM ile üret.',
+        order: 3,
+        required: true,
+      ),
+      GenerationStep(
+        id: 'presentation',
+        name: 'Presentation',
+### /mnt/data/v10work/lib/application/codegen/code_generation_runtime_module.dart
+import 'code_generation_orchestrator.dart';
+import '../../domain/codegen/generation_result.dart';
+import '../../domain/codegen/project_spec.dart';
+import '../runtime/production/runtime_module.dart';
+
+/// Kod üretim motorunu üretim çalışma zamanına bağlayan runtime modülüdür.
+///
+/// Orkestratörün kendisi dışarıdan enjekte edilir; böylece Composition Root
+/// gerçek ARES AI Gateway ve mevcut güvenlik katmanlarıyla kurulmuş üreticiyi
+/// kullanabilir. Bu modül doğrudan bir AI sağlayıcısı çağırmaz.
+class CodeGenerationRuntimeModule implements RuntimeModule {
+  CodeGenerationRuntimeModule(this.orchestrator);
+
+  final CodeGenerationOrchestrator orchestrator;
+  bool _started = false;
+
+  @override
+  String get name => 'Code Generation Runtime';
+
+  bool get isStarted => _started;
+
+  Future<GenerationResult> generate(ProjectSpec spec) {
+    if (!_started) {
+      throw StateError('Code Generation Runtime henüz başlatılmadı.');
+    }
+    return orchestrator.generate(spec);
+  }
+
+  @override
+  Future<void> start() async {
+    _started = true;
+  }
+
+  @override
+  Future<void> stop() async {
+    _started = false;
+  }
+}
+### /mnt/data/v10work/lib/application/codegen/code_validator_service.dart
+import '../../domain/codegen/artifact_type.dart';
+import '../../domain/codegen/code_artifact.dart';
+
+/// Kod üretim çıktısının temel doğrulama sonucudur.
+class CodeValidationReport {
+  const CodeValidationReport({
+    required List<String> errors,
+    required List<String> suggestedActions,
+  })  : errors = List.unmodifiable(errors),
+        suggestedActions = List.unmodifiable(suggestedActions);
+
+  final List<String> errors;
+  final List<String> suggestedActions;
+
+  bool get isValid => errors.isEmpty;
+}
+
+/// Üretilen artifact'lerin temel ve güvenli doğrulamasını yapar.
+///
+/// Bu servis tam bir Dart analyzer yerine üretim hattının erken aşamasında
+/// çalışacak hafif bir doğrulama katmanıdır. Amaç belirgin bozuk çıktıları,
+/// eksik referansları ve hatalı pubspec yapılarını LLM'e geri göndermeden önce
+/// yakalamaktır.
+class CodeValidatorService {
+  const CodeValidatorService();
+
+  CodeValidationReport validate(List<CodeArtifact> artifacts) {
+    final errors = <String>[];
+    final actions = <String>[];
+    final paths = <String>{};
+
+    for (final artifact in artifacts) {
+      final path = artifact.relativePath.trim();
+      if (path.isEmpty) {
+        errors.add('Artifact yolu boş.');
+        actions.add('Artifact için geçerli bir relativePath üret.');
+        continue;
+      }
+
+      if (!paths.add(path)) {
+        errors.add('Aynı artifact yolu birden fazla kez üretildi: $path');
+        actions.add('$path için tek bir artifact bırak.');
+      }
+
+      if (_isUnsafePath(path)) {
+        errors.add('Güvenli olmayan artifact yolu: $path');
+        actions.add('$path için yalnızca proje kökü altındaki göreli yolu kullan.');
+      }
+
+      if (artifact.type == ArtifactType.dart || path.endsWith('.dart')) {
+        _validateDart(
+          artifact,
+          paths: paths,
+          artifacts: artifacts,
+          errors: errors,
+          actions: actions,
+        );
+      }
+    }
+
+    final pubspec = _findArtifact(artifacts, 'pubspec.yaml');
+    if (pubspec != null) {
+      _validatePubspec(pubspec, errors, actions);
+    }
+
+    _validateReferences(artifacts, errors, actions);
+
+    return CodeValidationReport(
+      errors: errors,
+      suggestedActions: actions,
+    );
+  }
+
+  void _validateDart(
+    CodeArtifact artifact, {
+    required Set<String> paths,
+    required List<CodeArtifact> artifacts,
+    required List<String> errors,
+    required List<String> actions,
+  }) {
+    final content = artifact.content;
+    final path = artifact.relativePath;
+
+    final balanceError = _checkBalancedDelimiters(content);
+    if (balanceError != null) {
+      errors.add('$path: $balanceError');
+      actions.add('$path: Parantez, köşeli parantez ve süslü parantezleri dengele.');
+    }
+
+    final importLines = RegExp(
+      r'''^\s*import\s+['"]([^'"]+)['"]\s*;''',
+      multiLine: true,
+    ).allMatches(content);
+
+    for (final match in importLines) {
+      final importPath = match.group(1);
+      if (importPath == null) {
+        continue;
+      }
+      if (importPath.startsWith('dart:') || importPath.startsWith('package:flutter/')) {
+        continue;
+      }
+      if (importPath.startsWith('package:')) {
+        continue;
+      }
+      if (importPath.startsWith('.')) {
+        final target = _resolveRelativeImport(path, importPath);
+        if (!_containsPath(artifacts, target)) {
+          errors.add('$path: Eksik relative import: $importPath -> $target');
+          actions.add('$path: $importPath importunu mevcut bir artifact'e yönelt veya gerekli dosyayı üret.');
+        }
+      }
+    }
+  }
+
+  void _validatePubspec(
+    CodeArtifact artifact,
+    List<String> errors,
+    List<String> actions,
+  ) {
+    final content = artifact.content;
+    if (content.trim().isEmpty) {
+      errors.add('pubspec.yaml boş.');
+      actions.add('Geçerli bir pubspec.yaml içeriği üret.');
+      return;
+    }
+
+    final lines = const LineSplitter().convert(content);
+    var hasName = false;
+    var hasEnvironment = false;
+    var hasDependencies = false;
+    var hasFlutter = false;
+    var indentationError = false;
+
+    for (final line in lines) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty || trimmed.startsWith('#')) {
+        continue;
+      }
+      if (!trimmed.contains(':') && !trimmed.startsWith('-')) {
+        errors.add('pubspec.yaml: YAML satırı anahtar/değer yapısında değil: $line');
+        actions.add('pubspec.yaml içindeki satırı geçerli YAML anahtar/değer biçimine getir.');
+      }
+      final leadingSpaces = line.length - line.trimLeft().length;
+      if (leadingSpaces % 2 != 0) {
+        indentationError = true;
+      }
+      if (trimmed.startsWith('name:')) hasName = true;
+      if (trimmed.startsWith('environment:')) hasEnvironment = true;
+      if (trimmed.startsWith('dependencies:')) hasDependencies = true;
+      if (trimmed == 'flutter:' || trimmed.startsWith('flutter:')) hasFlutter = true;
+    }
+
+    if (!hasName) {
+      errors.add('pubspec.yaml: name alanı eksik.');
+      actions.add('pubspec.yaml içine geçerli bir name alanı ekle.');
+    }
+    if (!hasEnvironment) {
+      errors.add('pubspec.yaml: environment alanı eksik.');
+      actions.add('pubspec.yaml içine Dart SDK environment alanı ekle.');
+    }
+    if (!hasDependencies) {
+      errors.add('pubspec.yaml: dependencies alanı eksik.');
+      actions.add('pubspec.yaml içine dependencies bölümü ekle.');
+    }
+    if (!hasFlutter) {
+      errors.add('pubspec.yaml: Flutter bağımlılığı bulunamadı.');
+      actions.add('dependencies altında Flutter SDK bağımlılığını tanımla.');
+    }
+    if (indentationError) {
+      errors.add('pubspec.yaml: tutarsız girinti bulundu.');
+      actions.add('pubspec.yaml girintilerini tutarlı iki boşluk olacak şekilde düzelt.');
+    }
+  }
+
+  void _validateReferences(
+    List<CodeArtifact> artifacts,
+    List<String> errors,
+    List<String> actions,
+  ) {
+    final paths = artifacts.map((artifact) => artifact.relativePath).toSet();
+    final dartFiles = artifacts.where(
+      (artifact) => artifact.type == ArtifactType.dart || artifact.relativePath.endsWith('.dart'),
+    );
+
+    for (final artifact in dartFiles) {
+      final packageMatches = RegExp(
+        r'''package:([A-Za-z0-9_\-]+)/([^'";]+)''',
+      ).allMatches(artifact.content);
+      for (final match in packageMatches) {
+        final packageName = match.group(1);
+        final packagePath = match.group(2);
+        if (packageName == null || packagePath == null) continue;
+        final pubspec = _findArtifact(artifacts, 'pubspec.yaml');
+        if (pubspec != null && packageName == _readPackageName(pubspec.content)) {
+          final internalPath = packagePath.replaceAll('\\', '/');
+          if (!paths.contains(internalPath)) {
+            errors.add(
+              '${artifact.relativePath}: package içi referans bulunamadı: package:$packageName/$internalPath',
+            );
+            actions.add(
+              '${artifact.relativePath}: package içi referansı mevcut artifact yoluna bağla veya dosyayı üret.',
+            );
+          }
+        }
+      }
+    }
+  }
+
+  String? _readPackageName(String content) {
+    final match = RegExp(r'^\s*name:\s*([^\s#]+)', multiLine: true).firstMatch(content);
+    return match?.group(1);
+  }
+
+  CodeArtifact? _findArtifact(List<CodeArtifact> artifacts, String path) {
+    for (final artifact in artifacts) {
+      if (artifact.relativePath == path) return artifact;
+    }
+    return null;
+  }
+
+  bool _containsPath(List<CodeArtifact> artifacts, String target) {
+    return artifacts.any((artifact) => artifact.relativePath == target);
+  }
+
+  String _resolveRelativeImport(String sourcePath, String importPath) {
+    final sourceSegments = sourcePath.replaceAll('\\', '/').split('/');
+    sourceSegments.removeLast();
+    for (final segment in importPath.replaceAll('\\', '/').split('/')) {
+      if (segment.isEmpty || segment == '.') continue;
+      if (segment == '..') {
+        if (sourceSegments.isNotEmpty) sourceSegments.removeLast();
+      } else {
+        sourceSegments.add(segment);
+      }
+    }
+    return sourceSegments.join('/');
+  }
+
+  String? _checkBalancedDelimiters(String content) {
+    final stack = <String>[];
+    const pairs = <String, String>{
+      ')': '(',
+      ']': '[',
+      '}': '{',
+    };
+
+    var inSingleQuote = false;
+    var inDoubleQuote = false;
+    var escaped = false;
+
+    for (var i = 0; i < content.length; i++) {
+      final char = content[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if ((inSingleQuote || inDoubleQuote) && char == '\\') {
+        escaped = true;
+        continue;
+### /mnt/data/v10work/lib/application/codegen/code_writer_service.dart
+import '../../domain/codegen/code_artifact.dart';
+import '../../infrastructure/codegen/file_system_writer.dart';
+
+/// Sonuç olarak hangi artifact'lerin yazıldığını ve oluşan hataları taşır.
+class CodeWriteResult {
+  const CodeWriteResult({
+    required this.writtenPaths,
+    required this.errors,
+  });
+
+  final List<String> writtenPaths;
+  final List<String> errors;
+
+  bool get success => errors.isEmpty;
+
+  CodeWriteResult copyWith({
+    List<String>? writtenPaths,
+    List<String>? errors,
+  }) {
+    return CodeWriteResult(
+      writtenPaths: List.unmodifiable(writtenPaths ?? this.writtenPaths),
+      errors: List.unmodifiable(errors ?? this.errors),
+    );
+  }
+}
+
+/// CodeArtifact'leri gerçek dosya sistemine yazma işini orkestre eder.
+///
+/// Bu katman dosya sistemine doğrudan erişmez; gerçek I/O [FileSystemWriter]
+/// tarafından gerçekleştirilir.
+class CodeWriterService {
+  const CodeWriterService({required FileSystemWriter writer}) : _writer = writer;
+
+  final FileSystemWriter _writer;
+
+  Future<CodeWriteResult> writeArtifacts(
+    List<CodeArtifact> artifacts, {
+    bool overwrite = false,
+  }) async {
+    final writtenPaths = <String>[];
+    final errors = <String>[];
+
+    for (final artifact in artifacts) {
+      try {
+        final result = await _writer.writeArtifact(
+          artifact,
+          overwrite: overwrite,
+        );
+        if (result.written) {
+          writtenPaths.add(result.relativePath);
+        } else if (result.skipped) {
+          errors.add(
+            'Dosya atlandı: ${result.relativePath} (üzerine yazma kapalı).',
+          );
+        }
+      } on FileSystemWriterException catch (error) {
+        errors.add(error.message);
+      } catch (error) {
+        errors.add('${artifact.relativePath}: $error');
+      }
+    }
+
+    return CodeWriteResult(
+      writtenPaths: List.unmodifiable(writtenPaths),
+      errors: List.unmodifiable(errors),
+    );
+  }
+}
+### /mnt/data/v10work/lib/application/codegen/project_scaffold_service.dart
+import '../../domain/codegen/artifact_type.dart';
+import '../../domain/codegen/code_artifact.dart';
+import '../../domain/codegen/project_spec.dart';
+
+/// ProjectSpec kullanarak yeni bir Flutter projesinin temel Clean Architecture
+/// iskeletini bellekte CodeArtifact listesi olarak üretir.
+///
+/// Bu servis hiçbir dosyaya yazmaz, klasör oluşturmaz ve dış sistemlere erişmez.
+class ProjectScaffoldService {
+  const ProjectScaffoldService();
+
+  static const String _generatorName = 'ProjectScaffoldService';
+
+  /// Verilen [ProjectSpec] için temel proje dosyalarını üretir.
+  ///
+  /// Üretilen artifact'ler daha sonra ayrı bir writer katmanı tarafından
+  /// diske yazılabilir. Bu servis kendi başına herhangi bir yazma işlemi yapmaz.
+  List<CodeArtifact> generate(ProjectSpec spec) {
+    final artifacts = <CodeArtifact>[
+      _directoryMarker('lib/core/.gitkeep'),
+      _directoryMarker('lib/domain/.gitkeep'),
+      _directoryMarker('lib/application/.gitkeep'),
+      _directoryMarker('lib/infrastructure/.gitkeep'),
+      _directoryMarker('lib/presentation/.gitkeep'),
+      _directoryMarker('test/.gitkeep'),
+      _dartArtifact(
+        'lib/main.dart',
+        _mainDart(spec),
+      ),
+      _dartArtifact(
+        'lib/app/app.dart',
+        _appDart(spec),
+      ),
+      _yamlArtifact(
+        'pubspec.yaml',
+        _pubspec(spec),
+      ),
+      _yamlArtifact(
+        'analysis_options.yaml',
+        _analysisOptions(),
+      ),
+    ];
+
+    return List.unmodifiable(artifacts);
+  }
+
+  CodeArtifact _dartArtifact(String path, String content) {
+    return CodeArtifact(
+      relativePath: path,
+      content: content,
+      type: ArtifactType.dart,
+      generatedBy: _generatorName,
+    );
+  }
+
+  CodeArtifact _yamlArtifact(String path, String content) {
+    return CodeArtifact(
+      relativePath: path,
+      content: content,
+      type: ArtifactType.yaml,
+      generatedBy: _generatorName,
+    );
+  }
+
+  CodeArtifact _directoryMarker(String path) {
+    return CodeArtifact(
+      relativePath: path,
+      content: '',
+      type: ArtifactType.other,
+      generatedBy: _generatorName,
+    );
+  }
+
+  String _mainDart(ProjectSpec spec) {
+    final description = _dartComment(spec.description);
+    return '''// $description
+import 'app/app.dart';
+
+void main() {
+  runAresApp();
+}
+''';
+  }
+
+  String _appDart(ProjectSpec spec) {
+    final appName = _escapeDartString(spec.projectName);
+    return '''import 'package:flutter/material.dart';
+
+/// $appName uygulamasının temel Flutter uygulama katmanıdır.
+class AresApp extends StatelessWidget {
+  const AresApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '$appName',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        useMaterial3: true,
+      ),
+      home: const Scaffold(
+        body: Center(
+          child: Text('ARES'),
+        ),
+      ),
+    );
+  }
+}
+
+void runAresApp() {
+  runApp(const AresApp());
+}
+''';
+  }
+
+  String _pubspec(ProjectSpec spec) {
+    final packages = _uniqueSorted(spec.requiredPackages);
+    final dependencyLines = <String>[];
+    for (final packageName in packages) {
+      dependencyLines.add('  ${_yamlKey(packageName)}: any');
+    }
+
+    final dependencies = dependencyLines.isEmpty
+        ? 'dependencies:\n  flutter:\n    sdk: flutter'
+        : 'dependencies:\n  flutter:\n    sdk: flutter\n${dependencyLines.join('\n')}';
+
+    return '''name: ${_yamlKey(spec.packageName)}
+description: ${_yamlString(spec.description)}
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+$dependencies
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: any
+
+flutter:
+  uses-material-design: true
+''';
+  }
+
+  String _analysisOptions() {
+    return '''include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    avoid_print: true
+    prefer_const_constructors: true
+''';
+  }
+
+  List<String> _uniqueSorted(List<String> values) {
+    final normalized = <String>{};
+    for (final value in values) {
+      final trimmed = value.trim();
+      if (trimmed.isNotEmpty && trimmed != 'flutter') {
+        normalized.add(trimmed);
+      }
+    }
+    final result = normalized.toList()..sort();
+    return result;
+  }
+
+  String _yamlKey(String value) {
+    final trimmed = value.trim();
+    if (RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(trimmed)) {
+      return trimmed;
+    }
+    return _yamlString(trimmed);
+  }
+
+  String _yamlString(String value) {
+    final escaped = value.replaceAll('"', '\\"');
+    return '"$escaped"';
+  }
+
+  String _escapeDartString(String value) {
+    return value
+        .replaceAll('\\', '\\\\')
+        .replaceAll("'", "\\'")
+        .replaceAll('\n', '\\n')
+        .replaceAll('\r', '\\r');
+  }
+
+  String _dartComment(String value) {
+    return value
+        .replaceAll('\n', ' ')
+        .replaceAll('\r', ' ')
+        .replaceAll('*/', '* /')
+        .trim();
+  }
+}
+### /mnt/data/v10work/lib/application/codegen/prompt_builder_service.dart
+import '../../domain/codegen/project_spec.dart';
+
+/// Kod üretiminde kullanılabilecek ajan rolleri.
+enum CodegenAgentRole {
+  architect,
+  flutterDeveloper,
+  qaEngineer,
+  devOps,
+}
+
+extension CodegenAgentRoleLabel on CodegenAgentRole {
+  String get displayName {
+    switch (this) {
+      case CodegenAgentRole.architect:
+        return 'Architect';
+      case CodegenAgentRole.flutterDeveloper:
+        return 'FlutterDeveloper';
+      case CodegenAgentRole.qaEngineer:
+        return 'QAEngineer';
+      case CodegenAgentRole.devOps:
+        return 'DevOps';
+    }
+  }
+}
+
+/// LLM'e gönderilecek sistem ve kullanıcı promptlarını birlikte taşır.
+class CodegenPrompt {
+  const CodegenPrompt({
+    required this.role,
+    required this.systemPrompt,
+    required this.userPrompt,
+  });
+
+  final CodegenAgentRole role;
+  final String systemPrompt;
+  final String userPrompt;
+}
+
+/// Her ajan rolü için güvenli ve sınırlı bağlam oluşturan prompt üreticisidir.
+class PromptBuilderService {
+  const PromptBuilderService();
+
+  CodegenPrompt build({
+    required CodegenAgentRole role,
+    required ProjectSpec projectSpec,
+    required List<String> relevantFiles,
+  }) {
+    final roleName = role.displayName;
+    final context = _buildContext(
+      projectSpec: projectSpec,
+      relevantFiles: relevantFiles,
+    );
+
+    return CodegenPrompt(
+      role: role,
+      systemPrompt: _systemPrompt(roleName),
+      userPrompt: _userPrompt(
+        roleName: roleName,
+        context: context,
+      ),
+    );
+  }
+
+  String _systemPrompt(String roleName) {
+    final common = '''
+Sen DEST-OS ARES Kod Üretim Motoru içinde çalışan $roleName ajanısın.
+Sadece sana verilen ProjectSpec ve ilgili dosya bağlamını kullan.
+Bağlamda bulunmayan proje ayrıntılarını uydurma.
+Ürettiğin çıktı JSON olmalı ve şu kök yapıyı kullanmalıdır:
+{"artifacts":[{"relativePath":"...","content":"...","type":"dart|yaml|markdown|json|other","generatedBy":"$roleName"}]}
+Her artifact gerçek bir dosyayı temsil eder. relativePath göreli olmalı ve proje kökü dışına çıkmamalıdır.
+''';
+
+    switch (roleName) {
+      case 'Architect':
+        return '$common\nMimari sınırları, katman ayrımını, bağımlılık yönünü ve dosya sorumluluklarını koru.';
+      case 'FlutterDeveloper':
+        return '$common\nFlutter/Dart kodunu derlenebilir, okunabilir ve mevcut mimariye uyumlu üret.';
+      case 'QAEngineer':
+        return '$common\nTest edilebilirlik, acceptance criteria, hata senaryoları ve doğrulanabilir çıktılara odaklan.';
+      case 'DevOps':
+        return '$common\nBuild, yapılandırma, CI/CD, ortam ve dağıtım dosyalarını güvenli ve tekrarlanabilir üret.';
+      default:
+        return common;
+    }
+  }
+
+  String _userPrompt({
+    required String roleName,
+    required String context,
+  }) {
+    return '''
+Rol: $roleName
+
+Aşağıdaki sınırlı bağlamı kullanarak görevi yerine getir.
+Sadece bu bağlamdaki ProjectSpec ve ilgili dosyalarla ilişkili dosyaları üret.
+Mevcut dosyaları değiştirmek gerekiyorsa tam dosya içeriğini artifact olarak döndür.
+
+BAĞLAM:
+$context
+
+Çıktı yalnızca geçerli JSON olsun. Açıklama, Markdown çiti veya JSON dışı metin ekleme.
+''';
+  }
+
+  String _buildContext({
+    required ProjectSpec projectSpec,
+    required List<String> relevantFiles,
+  }) {
+    final files = List.unmodifiable(relevantFiles);
+    final buffer = StringBuffer()
+      ..writeln('PROJECT_SPEC')
+      ..writeln('projectName: ${projectSpec.projectName}')
+      ..writeln('description: ${projectSpec.description}')
+      ..writeln('packageName: ${projectSpec.packageName}')
+      ..writeln('architecture: ${projectSpec.architecture.name}')
+      ..writeln('features: ${projectSpec.features.join(', ')}')
+      ..writeln('requiredPackages: ${projectSpec.requiredPackages.join(', ')}')
+      ..writeln('screens: ${projectSpec.screens.join(', ')}')
+      ..writeln('acceptanceCriteria: ${projectSpec.acceptanceCriteria.join(' | ')}')
+      ..writeln('includeTests: ${projectSpec.includeTests}')
+      ..writeln('includeReadme: ${projectSpec.includeReadme}')
+      ..writeln()
+      ..writeln('RELEVANT_FILES');
+
+    if (files.isEmpty) {
+      buffer.writeln('(none)');
+    } else {
+      for (final file in files) {
+        buffer.writeln('- $file');
+      }
+    }
+
+    return buffer.toString();
+  }
+}
+### /mnt/data/v10work/lib/domain/codegen/architecture_type.dart
+enum ArchitectureType {
+  clean,
+  simple,
+  featureFirst,
+}
+### /mnt/data/v10work/lib/domain/codegen/artifact_type.dart
+enum ArtifactType {
+  dart,
+  yaml,
+  markdown,
+  json,
+  other,
+}
+### /mnt/data/v10work/lib/domain/codegen/code_artifact.dart
+import 'artifact_type.dart';
+
+/// Kod üretim motorunun oluşturduğu tek bir dosyayı temsil eder.
+class CodeArtifact {
+  const CodeArtifact({
+    required this.relativePath,
+    required this.content,
+    required this.type,
+    required this.generatedBy,
+  });
+
+  final String relativePath;
+  final String content;
+  final ArtifactType type;
+  final String generatedBy;
+
+  CodeArtifact copyWith({
+    String? relativePath,
+    String? content,
+    ArtifactType? type,
+    String? generatedBy,
+  }) {
+    return CodeArtifact(
+      relativePath: relativePath ?? this.relativePath,
+      content: content ?? this.content,
+      type: type ?? this.type,
+      generatedBy: generatedBy ?? this.generatedBy,
+    );
+  }
+}
+### /mnt/data/v10work/lib/domain/codegen/generation_plan.dart
+/// Kod üretim sürecinin değişmez planını temsil eder.
+class GenerationPlan {
+  const GenerationPlan({
+    required this.projectName,
+    required List<GenerationStep> steps,
+  }) : steps = List.unmodifiable(steps);
+
+  final String projectName;
+  final List<GenerationStep> steps;
+
+  GenerationPlan copyWith({
+    String? projectName,
+    List<GenerationStep>? steps,
+  }) {
+    return GenerationPlan(
+      projectName: projectName ?? this.projectName,
+      steps: steps ?? this.steps,
+    );
+  }
+}
+
+/// Kod üretim planındaki tek bir adımı temsil eder.
+class GenerationStep {
+  const GenerationStep({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.order,
+    required this.required,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final int order;
+  final bool required;
+
+  GenerationStep copyWith({
+    String? id,
+    String? name,
+    String? description,
+    int? order,
+    bool? required,
+  }) {
+    return GenerationStep(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      description: description ?? this.description,
+      order: order ?? this.order,
+      required: required ?? this.required,
+    );
+  }
+}
+### /mnt/data/v10work/lib/domain/codegen/generation_result.dart
+import 'code_artifact.dart';
+
+/// Kod üretim işleminin değişmez sonucudur.
+class GenerationResult {
+  const GenerationResult({
+    required this.success,
+    required List<CodeArtifact> artifacts,
+    required List<String> errors,
+    required Map<String, Object?> metrics,
+  }) : artifacts = List.unmodifiable(artifacts),
+       errors = List.unmodifiable(errors),
+       metrics = Map.unmodifiable(metrics);
+
+  final bool success;
+  final List<CodeArtifact> artifacts;
+  final List<String> errors;
+  final Map<String, Object?> metrics;
+
+  GenerationResult copyWith({
+    bool? success,
+    List<CodeArtifact>? artifacts,
+    List<String>? errors,
+    Map<String, Object?>? metrics,
+  }) {
+    return GenerationResult(
+      success: success ?? this.success,
+      artifacts: artifacts ?? this.artifacts,
+      errors: errors ?? this.errors,
+      metrics: metrics ?? this.metrics,
+    );
+  }
+}
+### /mnt/data/v10work/lib/domain/codegen/project_spec.dart
+import 'architecture_type.dart';
+
+/// Kod üretim motorunun üreteceği projenin değişmez tanımıdır.
+class ProjectSpec {
+  const ProjectSpec({
+    required this.projectName,
+    required this.description,
+    required this.packageName,
+    required this.features,
+    required this.architecture,
+    required this.requiredPackages,
+    required this.screens,
+    required this.acceptanceCriteria,
+    required this.includeTests,
+    required this.includeReadme,
+  }) : features = List.unmodifiable(features),
+       requiredPackages = List.unmodifiable(requiredPackages),
+       screens = List.unmodifiable(screens),
+       acceptanceCriteria = List.unmodifiable(acceptanceCriteria);
+
+  final String projectName;
+  final String description;
+  final String packageName;
+  final List<String> features;
+  final ArchitectureType architecture;
+  final List<String> requiredPackages;
+  final List<String> screens;
+  final List<String> acceptanceCriteria;
+  final bool includeTests;
+  final bool includeReadme;
+
+  ProjectSpec copyWith({
+    String? projectName,
+    String? description,
+    String? packageName,
+    List<String>? features,
+    ArchitectureType? architecture,
+    List<String>? requiredPackages,
+    List<String>? screens,
+    List<String>? acceptanceCriteria,
+    bool? includeTests,
+    bool? includeReadme,
+  }) {
+    return ProjectSpec(
+      projectName: projectName ?? this.projectName,
+      description: description ?? this.description,
+      packageName: packageName ?? this.packageName,
+      features: features ?? this.features,
+      architecture: architecture ?? this.architecture,
+      requiredPackages: requiredPackages ?? this.requiredPackages,
+      screens: screens ?? this.screens,
+      acceptanceCriteria: acceptanceCriteria ?? this.acceptanceCriteria,
+      includeTests: includeTests ?? this.includeTests,
+      includeReadme: includeReadme ?? this.includeReadme,
+    );
+  }
+}
+### /mnt/data/v10work/lib/domain/codegen/quality_gate.dart
+/// Kod üretiminden sonra uygulanacak değişmez kalite kapısını temsil eder.
+class QualityGate {
+  const QualityGate({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.required,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final bool required;
+
+  QualityGate copyWith({
+    String? id,
+    String? name,
+    String? description,
+    bool? required,
+  }) {
+    return QualityGate(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      description: description ?? this.description,
+      required: required ?? this.required,
+    );
+  }
+}
+
+/// Bir kalite kapısının değerlendirme sonucudur.
+class GateResult {
+  const GateResult({
+    required this.gateId,
+    required this.passed,
+    required this.message,
+  });
+
+  final String gateId;
+  final bool passed;
+  final String message;
+
+  GateResult copyWith({
+    String? gateId,
+    bool? passed,
+    String? message,
+  }) {
+    return GateResult(
+      gateId: gateId ?? this.gateId,
+      passed: passed ?? this.passed,
+      message: message ?? this.message,
+    );
+  }
+}
+### /mnt/data/v10work/lib/infrastructure/codegen/file_system_writer.dart
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+import '../../domain/codegen/code_artifact.dart';
+
+/// Tek bir artifact yazma işleminin sonucudur.
+class FileWriteResult {
+  const FileWriteResult({
+    required this.relativePath,
+    required this.written,
+    required this.skipped,
+  });
+
+  final String relativePath;
+  final bool written;
+  final bool skipped;
+}
+
+class FileSystemWriterException implements Exception {
+  const FileSystemWriterException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// CodeArtifact'leri güvenli biçimde gerçek dosya sistemine yazar.
+///
+/// [rootDirectory] verilirse yalnızca o kökün altına yazılır. Verilmezse
+/// uygulamanın path_provider üzerinden aldığı belgeler dizini kök olarak
+/// kullanılır.
+class FileSystemWriter {
+  FileSystemWriter({Directory? rootDirectory})
+      : _rootDirectory = rootDirectory;
+
+  final Directory? _rootDirectory;
+
+  Directory? _resolvedRoot;
+
+  Future<Directory> _root() async {
+    final cached = _resolvedRoot;
+    if (cached != null) {
+      return cached;
+    }
+
+    final root = _rootDirectory ?? await getApplicationDocumentsDirectory();
+    final absolute = Directory(p.normalize(p.absolute(root.path)));
+    await absolute.create(recursive: true);
+    _resolvedRoot = absolute;
+    return absolute;
+  }
+
+  Future<FileWriteResult> writeArtifact(
+    CodeArtifact artifact, {
+    bool overwrite = false,
+  }) async {
+    final root = await _root();
+    final safeRelativePath = _validateRelativePath(artifact.relativePath);
+    final targetPath = _safeResolve(root.path, safeRelativePath);
+    final file = File(targetPath);
+
+    if (await file.exists() && !overwrite) {
+      return FileWriteResult(
+        relativePath: safeRelativePath,
+        written: false,
+        skipped: true,
+      );
+    }
+
+    try {
+      await file.parent.create(recursive: true);
+      await file.writeAsString(artifact.content, flush: true);
+    } on FileSystemException catch (error) {
+      throw FileSystemWriterException(
+        '${safeRelativePath}: dosya yazılamadı: ${error.message}',
+      );
+    }
+
+    return FileWriteResult(
+      relativePath: safeRelativePath,
+      written: true,
+      skipped: false,
+    );
+  }
+
+  String _validateRelativePath(String rawPath) {
+    final value = rawPath.trim();
+    if (value.isEmpty) {
+      throw const FileSystemWriterException('Boş dosya yolu yazılamaz.');
+    }
+    if (p.isAbsolute(value)) {
+      throw FileSystemWriterException(
+        'Path traversal engellendi: mutlak yol kullanılamaz: $value',
+      );
+    }
+
+    final normalized = p.normalize(value);
+    if (normalized == '.' || normalized == '..' || normalized.startsWith('..${p.separator}')) {
+      throw FileSystemWriterException(
+        'Path traversal engellendi: kök dizinin dışına çıkış: $value',
+      );
+    }
+
+    return normalized;
+  }
+
+  String _safeResolve(String rootPath, String relativePath) {
+    final root = p.normalize(p.absolute(rootPath));
+    final candidate = p.normalize(p.join(root, relativePath));
+    final relativeToRoot = p.relative(candidate, from: root);
+
+    if (relativeToRoot == '..' ||
+        relativeToRoot.startsWith('..${p.separator}') ||
+        p.isAbsolute(relativeToRoot)) {
+      throw FileSystemWriterException(
+        'Path traversal engellendi: hedef kök dizinin dışında: $relativePath',
+      );
+    }
+
+    return candidate;
+  }
+}
+### /mnt/data/v10work/lib/infrastructure/codegen/llm_code_generator.dart
+import 'dart:convert';
+
+import '../../application/ai/ai_gateway.dart';
+import '../../application/decision/decision_engine.dart';
+import '../../application/runtime/paid_ai_runtime_gate.dart';
+import '../../core/result/ares_result.dart';
+import '../../core/security/cost_policy.dart';
+import '../../domain/ai/ai_request.dart';
+import '../../domain/ai/ai_response.dart';
+import '../../domain/codegen/artifact_type.dart';
+import '../../domain/codegen/code_artifact.dart';
+import '../../domain/runtime/ai_runtime_request.dart';
+import '../../application/codegen/prompt_builder_service.dart';
+
+/// LLM kod üretimi için altyapı sözleşmesi.
+abstract interface class LlmCodeGenerator {
+  Future<AresResult<List<CodeArtifact>>> generate(
+    CodegenPrompt prompt, {
+    AiCostClass costClass,
+    String? provider,
+    String? model,
+  });
+}
+
+/// Mevcut ARES AI Gateway üzerinden gerçek API entegrasyonuna hazır üreticidir.
+/// Gateway'in kendisi sağlayıcı/API ayrıntılarını yönetir.
+class ApiLlmCodeGenerator implements LlmCodeGenerator {
+  ApiLlmCodeGenerator({
+    required this.gateway,
+    this.paidGate = const PaidAiRuntimeGate(),
+    this.decisionEngine = DecisionEngine(),
+  });
+
+  final AresAiGateway gateway;
+  final PaidAiRuntimeGate paidGate;
+  final DecisionEngine decisionEngine;
+
+  @override
+  Future<AresResult<List<CodeArtifact>>> generate(
+    CodegenPrompt prompt, {
+    AiCostClass costClass = AiCostClass.local,
+    String? provider,
+    String? model,
+  }) async {
+    final runtimeRequest = AiRuntimeRequest(
+      instruction: '${prompt.systemPrompt}\n\n${prompt.userPrompt}',
+      costClass: costClass,
+      provider: provider,
+      model: model,
+      metadata: <String, Object?>{
+        'feature': 'code_generation',
+        'agentRole': prompt.role.displayName,
+        'structuredOutput': true,
+      },
+    );
+
+    final gate = paidGate.evaluate(runtimeRequest);
+    if (!gate.mayRun) {
+      return AresFailure<List<CodeArtifact>>(
+        'Kod üretimi başlatılmadı: ${gate.reason}',
+      );
+    }
+
+    final decision = decisionEngine.decide(
+      id: 'codegen-${prompt.role.name}',
+      archiveAvailable: false,
+      localAiAvailable:
+          costClass == AiCostClass.local,
+      freeAiAvailable:
+          costClass == AiCostClass.free ||
+          costClass == AiCostClass.limitedFree,
+      paidAiAvailable: costClass == AiCostClass.paid,
+    );
+
+    if (decision.requiresUserApproval) {
+      return AresFailure<List<CodeArtifact>>(
+        'Kod üretimi için İbrahim onayı gerekiyor: ${decision.reason}',
+      );
+    }
+
+    if (decision.type.name == 'defer') {
+      return AresFailure<List<CodeArtifact>>(
+        'Kod üretimi ertelendi: ${decision.reason}',
+      );
+    }
+
+    try {
+      final response = await gateway.generate(
+        AiRequest(
+          instruction: runtimeRequest.instruction,
+          costClass: costClass,
+        ),
+      );
+
+      if (response is AresFailure<AiResponse>) {
+        return AresFailure<List<CodeArtifact>>(
+          'LLM isteği başarısız: ${response.message}',
+        );
+      }
+
+      if (response is! AresSuccess<AiResponse>) {
+        return const AresFailure<List<CodeArtifact>>(
+          'LLM isteği beklenmeyen bir sonuç döndürdü.',
+        );
+      }
+
+      return _parseStructuredOutput(
+        response.value.text,
+        fallbackGeneratedBy: prompt.role.displayName,
+      );
+    } catch (error) {
+      return AresFailure<List<CodeArtifact>>(
+        'LLM çağrısı sırasında hata oluştu: $error',
+      );
+    }
+  }
+
+  AresResult<List<CodeArtifact>> _parseStructuredOutput(
+    String raw,
+    {required String fallbackGeneratedBy},
+  ) {
+    try {
+      final decoded = jsonDecode(raw);
+      final dynamic rawArtifacts = decoded is Map<String, dynamic>
+          ? decoded['artifacts']
+          : decoded;
+
+      if (rawArtifacts is! List) {
+        return const AresFailure<List<CodeArtifact>>(
+          'LLM çıktısı geçersiz: "artifacts" listesi bulunamadı.',
+        );
+      }
+
+      final artifacts = <CodeArtifact>[];
+      for (var index = 0; index < rawArtifacts.length; index++) {
+        final item = rawArtifacts[index];
+        if (item is! Map) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı geçersiz: $index numaralı artifact nesne değil.',
+          );
+        }
+
+        final path = item['relativePath'];
+        final content = item['content'];
+        final typeValue = item['type'];
+        final generatedBy = item['generatedBy'] ?? fallbackGeneratedBy;
+
+        if (path is! String || path.trim().isEmpty) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı geçersiz: $index numaralı artifact için relativePath eksik.',
+          );
+        }
+        if (content is! String) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı geçersiz: $path için content metin değil.',
+          );
+        }
+        if (generatedBy is! String || generatedBy.trim().isEmpty) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı geçersiz: $path için generatedBy eksik.',
+          );
+        }
+
+        final type = _artifactType(typeValue);
+        if (type == null) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı geçersiz: $path için artifact type tanınmıyor.',
+          );
+        }
+
+        if (_isUnsafeRelativePath(path)) {
+          return AresFailure<List<CodeArtifact>>(
+            'LLM çıktısı reddedildi: güvenli olmayan dosya yolu "$path".',
+          );
+        }
+
+        artifacts.add(
+          CodeArtifact(
+            relativePath: path,
+            content: content,
+            type: type,
+            generatedBy: generatedBy,
+          ),
+        );
+      }
+
+      return AresSuccess<List<CodeArtifact>>(List.unmodifiable(artifacts));
+    } on FormatException catch (error) {
+      return AresFailure<List<CodeArtifact>>(
+        'LLM çıktısı geçerli JSON değil: ${error.message}',
+      );
+    } catch (error) {
+      return AresFailure<List<CodeArtifact>>(
+        'LLM çıktısı CodeArtifact formatına çevrilemedi: $error',
+      );
+    }
+  }
+
+  ArtifactType? _artifactType(Object? value) {
+    if (value is! String) {
+      return null;
+    }
+
+    for (final type in ArtifactType.values) {
+      if (type.name == value) {
+        return type;
+      }
+    }
+    return null;
+  }
+
+  bool _isUnsafeRelativePath(String value) {
+    final normalized = value.replaceAll('\\', '/');
+    return normalized.startsWith('/') ||
+        normalized.startsWith('~/') ||
+        normalized.split('/').contains('..') ||
+        RegExp(r'^[A-Za-z]:/').hasMatch(normalized);
+  }
+}
+
+/// Gerçek ağ/API çağrısı yapmadan kod üretim akışını test etmek için kullanılır.
+class MockLlmCodeGenerator implements LlmCodeGenerator {
+  const MockLlmCodeGenerator({this.responseJson});
+
+  final String? responseJson;
+
+  @override
+  Future<AresResult<List<CodeArtifact>>> generate(
+    CodegenPrompt prompt, {
+    AiCostClass costClass = AiCostClass.local,
+    String? provider,
+    String? model,
+  }) async {
+    if (costClass == AiCostClass.paid || costClass == AiCostClass.unknown) {
+      return const AresFailure<List<CodeArtifact>>(
+        'Mock kod üreticisi de ücretli/bilinmeyen maliyetli AI kullanımını onaysız çalıştırmaz.',
+      );
+    }
+
+    final json = responseJson ??
+        jsonEncode(<String, Object?>{
+          'artifacts': <Map<String, Object?>>[
+            <String, Object?>{
+              'relativePath': 'lib/generated/generated_code.dart',
+              'content': '// Mock generated by ARES Codegen.\n',
+              'type': 'dart',
+              'generatedBy': prompt.role.displayName,
+            },
+          ],
+        });
+
+    final parser = ApiLlmCodeGenerator(
+      gateway: _UnusedGateway(),
+    );
+    return parser._parseStructuredOutput(
+      json,
+      fallbackGeneratedBy: prompt.role.displayName,
+    );
+  }
+}
+### /mnt/data/v10work/lib/presentation/codegen/code_generation_screen.dart
+import 'package:flutter/material.dart';
+
+import '../../domain/codegen/generation_result.dart';
+
+/// ARES Kod Üretim Motorunun kullanıcı arayüzüdür.
+///
+/// Ekran, üretim motoruna doğrudan bağımlı değildir. Gerçek üretim işlemi
+/// [onGenerate] callback'i üzerinden dışarıdan verilir. Böylece UI katmanı
+/// CEO/Task/Agent/AI Gateway katmanlarına doğrudan erişmez.
+class CodeGenerationScreen extends StatefulWidget {
+  const CodeGenerationScreen({super.key, this.onGenerate});
+
+  final Future<GenerationResult> Function(String request)? onGenerate;
+
+  @override
+  State<CodeGenerationScreen> createState() => _CodeGenerationScreenState();
+}
+
+class _CodeGenerationScreenState extends State<CodeGenerationScreen> {
+  final TextEditingController _requestController = TextEditingController();
+  bool _isGenerating = false;
+  String _status = 'Hazır';
+  GenerationResult? _result;
+  String? _errorMessage;
+
+  @override
+  void dispose() {
+    _requestController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _generate() async {
+    final request = _requestController.text.trim();
+    if (request.isEmpty) {
+      setState(() {
+        _errorMessage = 'Lütfen üretilecek uygulamayı veya projeyi açıklayın.';
+        _status = 'İstek bekleniyor';
+      });
+      return;
+    }
+
+    final generator = widget.onGenerate;
+    if (generator == null) {
+      setState(() {
+        _errorMessage = 'Kod üretim çalışma zamanı bu ekrana henüz bağlanmadı.';
+        _status = 'Yapılandırma bekleniyor';
+      });
+      return;
+    }
+
+    setState(() {
+      _isGenerating = true;
+      _status = 'İstek hazırlanıyor';
+      _errorMessage = null;
+      _result = null;
+    });
+
+    try {
+      setState(() => _status = 'Kod üretimi çalışıyor');
+      final result = await generator(request);
+      if (!mounted) return;
+      setState(() {
+        _result = result;
+        _isGenerating = false;
+        _status = result.success ? 'Üretim tamamlandı' : 'Üretim hatayla tamamlandı';
+        _errorMessage = result.success || result.errors.isEmpty
+            ? null
+            : result.errors.join('\n');
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isGenerating = false;
+        _status = 'Üretim sırasında hata oluştu';
+        _errorMessage = '$error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final result = _result;
+    final artifacts = result?.artifacts ?? const [];
+    return Scaffold(
+      backgroundColor: const Color(0xFF05080D),
+      appBar: AppBar(
+        title: const Text('ARES — KOD ÜRETİM MERKEZİ'),
+        backgroundColor: const Color(0xFF08131D),
+        foregroundColor: Colors.white,
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(18),
+          children: [
+            _SectionCard(
+              title: 'YÜKSEK SEVİYELİ İSTEK',
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: _requestController,
+                    minLines: 5,
+                    maxLines: 9,
+                    enabled: !_isGenerating,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      hintText: 'Örneğin: Flutter ile görev yönetimi yapan, koyu temalı bir tablet uygulaması oluştur.',
+                      hintStyle: const TextStyle(color: Colors.white38),
+                      filled: true,
+                      fillColor: const Color(0xFF071019),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: const BorderSide(color: Colors.white12),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: const BorderSide(color: Colors.white12),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: const BorderSide(color: Colors.cyanAccent),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    height: 48,
+                    child: FilledButton.icon(
+                      onPressed: _isGenerating ? null : _generate,
+                      icon: _isGenerating
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.auto_awesome),
+                      label: Text(_isGenerating ? 'ÜRETİLİYOR...' : 'ÜRET'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF007C91),
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            _SectionCard(
+              title: 'ÜRETİM DURUMU',
+              child: Row(
+                children: [
+                  Icon(
+                    _isGenerating
+                        ? Icons.sync
+                        : result?.success == true
+                            ? Icons.check_circle_outline
+                            : Icons.memory,
+                    color: Colors.cyanAccent,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _status,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            if (_isGenerating) ...[
+              const _ProgressSteps(),
+              const SizedBox(height: 14),
+            ],
+            _SectionCard(
+              title: 'ÜRETİLEN DOSYALAR',
+              child: artifacts.isEmpty
+                  ? const Text('Henüz üretilen dosya yok.', style: TextStyle(color: Colors.white54))
+                  : Column(
+                      children: artifacts
+                          .map(
+                            (artifact) => ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.description_outlined, color: Colors.cyanAccent),
+                              title: Text(artifact.relativePath, style: const TextStyle(color: Colors.white)),
+                              subtitle: Text(artifact.type.name, style: const TextStyle(color: Colors.white38)),
+                            ),
+                          )
+                          .toList(),
+                    ),
+            ),
+            if (result != null && result.success) ...[
+              const SizedBox(height: 14),
+              const _MessageCard(
+                title: 'BAŞARILI',
+                message: 'Kod üretimi başarıyla tamamlandı.',
+                icon: Icons.check_circle,
+              ),
+            ],
+            if (_errorMessage != null) ...[
+              const SizedBox(height: 14),
+              _MessageCard(
+                title: 'HATA',
+                message: _errorMessage!,
+                icon: Icons.error_outline,
+                isError: true,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SectionCard extends StatelessWidget {
+  const _SectionCard({required this.title, required this.child});
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0A1722),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.cyanAccent.withOpacity(0.20)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.cyanAccent,
+              fontSize: 15,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.1,
+            ),
+          ),
+          const SizedBox(height: 12),
+          child,
+        ],
+      ),
+    );
+  }
+}
+
+class _ProgressSteps extends StatelessWidget {
+  const _ProgressSteps();
+
+  @override
+  Widget build(BuildContext context) {
+    const steps = ['İstek', 'Plan', 'Scaffold', 'Kod', 'Doğrulama', 'Yazma'];

@@ -1,0 +1,37 @@
+name: ARES APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kaynak kodu al
+        uses: actions/checkout@v4
+
+      - name: Flutter kur
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter bağımlılıkları
+        run: flutter pub get
+
+      - name: Analiz
+        run: flutter analyze
+
+      - name: Testler
+        run: flutter test
+
+      - name: Release APK oluştur
+        run: flutter build apk --release
+
+      - name: APK yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dest-os-ares-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk

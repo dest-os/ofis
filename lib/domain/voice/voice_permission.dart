@@ -1,0 +1,1 @@
+enum VoicePermission { microphone }

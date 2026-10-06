@@ -1,0 +1,1 @@
+enum InteractionTarget { listener, centerEye }
